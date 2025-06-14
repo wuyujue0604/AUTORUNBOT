@@ -1,0 +1,122 @@
+[
+  {
+    "symbol": "PI-USDT-SWAP",
+    "score": 0.6607,
+    "indicators": {
+      "RSI": 0.595,
+      "MACD": 0.983,
+      "KDJ": 0.471,
+      "BOLL": 0.724,
+      "Volume": 0.271
+    },
+    "strategy": "trend"
+  },
+  {
+    "symbol": "APE-USDT-SWAP",
+    "score": 0.2682,
+    "indicators": {
+      "RSI": 0.39,
+      "MACD": 0.386,
+      "KDJ": 0.0,
+      "BOLL": 0.081,
+      "Volume": 0.179
+    },
+    "strategy": "trend"
+  },
+  {
+    "symbol": "STRK-USDT-SWAP",
+    "score": 0.2647,
+    "indicators": {
+      "RSI": 0.316,
+      "MACD": 0.004,
+      "KDJ": 0.0,
+      "BOLL": 0.047,
+      "Volume": 1.0
+    },
+    "strategy": "trend"
+  },
+  {
+    "symbol": "CETUS-USDT-SWAP",
+    "score": 0.2576,
+    "indicators": {
+      "RSI": 0.281,
+      "MACD": 0.003,
+      "KDJ": 0.0,
+      "BOLL": 0.075,
+      "Volume": 1.0
+    },
+    "strategy": "trend"
+  },
+  {
+    "symbol": "UNI-USDT-SWAP",
+    "score": 0.2369,
+    "indicators": {
+      "RSI": 0.421,
+      "MACD": 0.032,
+      "KDJ": 0.212,
+      "BOLL": 0.347,
+      "Volume": 0.488
+    },
+    "strategy": "trend"
+  },
+  {
+    "symbol": "CRO-USDT-SWAP",
+    "score": 0.21,
+    "indicators": {
+      "RSI": 0.364,
+      "MACD": 0.315,
+      "KDJ": 0.026,
+      "BOLL": 0.265,
+      "Volume": 0.037
+    },
+    "strategy": "range"
+  },
+  {
+    "symbol": "WIF-USDT-SWAP",
+    "score": 0.1743,
+    "indicators": {
+      "RSI": 0.392,
+      "MACD": 0.045,
+      "KDJ": 0.0,
+      "BOLL": 0.165,
+      "Volume": 0.39
+    },
+    "strategy": "trend"
+  },
+  {
+    "symbol": "SUSHI-USDT-SWAP",
+    "score": 0.161,
+    "indicators": {
+      "RSI": 0.347,
+      "MACD": 0.001,
+      "KDJ": 0.0,
+      "BOLL": 0.112,
+      "Volume": 0.457
+    },
+    "strategy": "trend"
+  },
+  {
+    "symbol": "GPS-USDT-SWAP",
+    "score": 0.0984,
+    "indicators": {
+      "RSI": 0.34,
+      "MACD": 0.013,
+      "KDJ": 0.081,
+      "BOLL": 0.24,
+      "Volume": 0.045
+    },
+    "strategy": "trend"
+  },
+  {
+    "symbol": "XLM-USDT-SWAP",
+    "score": 0.0792,
+    "indicators": {
+      "RSI": 0.221,
+      "MACD": 0.003,
+      "KDJ": 0.0,
+      "BOLL": 0.137,
+      "Volume": 0.17
+    },
+    "strategy": "trend"
+  }
+]

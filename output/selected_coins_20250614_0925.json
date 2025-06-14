@@ -1,0 +1,132 @@
+[
+  {
+    "symbol": "WIF-USDT-SWAP",
+    "score": 0.6467,
+    "direction": "long",
+    "indicators": {
+      "RSI": 0.667,
+      "MACD": 0.714,
+      "KDJ": 0.798,
+      "BOLL": 0.716,
+      "Volume": 0.38
+    },
+    "strategy": "trend"
+  },
+  {
+    "symbol": "CRO-USDT-SWAP",
+    "score": 0.637,
+    "direction": "long",
+    "indicators": {
+      "RSI": 0.694,
+      "MACD": 0.766,
+      "KDJ": 0.801,
+      "BOLL": 0.725,
+      "Volume": 0.217
+    },
+    "strategy": "trend"
+  },
+  {
+    "symbol": "CETUS-USDT-SWAP",
+    "score": 0.5993,
+    "direction": "long",
+    "indicators": {
+      "RSI": 0.627,
+      "MACD": 0.617,
+      "KDJ": 0.654,
+      "BOLL": 0.63,
+      "Volume": 0.273
+    },
+    "strategy": "range"
+  },
+  {
+    "symbol": "XLM-USDT-SWAP",
+    "score": 0.5728,
+    "direction": "long",
+    "indicators": {
+      "RSI": 0.629,
+      "MACD": 0.663,
+      "KDJ": 0.574,
+      "BOLL": 0.682,
+      "Volume": 0.093
+    },
+    "strategy": "range"
+  },
+  {
+    "symbol": "SUSHI-USDT-SWAP",
+    "score": 0.4556,
+    "direction": "long",
+    "indicators": {
+      "RSI": 0.535,
+      "MACD": 0.619,
+      "KDJ": 0.393,
+      "BOLL": 0.572,
+      "Volume": 0.01
+    },
+    "strategy": "range"
+  },
+  {
+    "symbol": "UNI-USDT-SWAP",
+    "score": 0.4463,
+    "direction": "long",
+    "indicators": {
+      "RSI": 0.449,
+      "MACD": 0.655,
+      "KDJ": 0.347,
+      "BOLL": 0.582,
+      "Volume": 0.256
+    },
+    "strategy": "range"
+  },
+  {
+    "symbol": "STRK-USDT-SWAP",
+    "score": 0.4103,
+    "direction": "long",
+    "indicators": {
+      "RSI": 0.5,
+      "MACD": 0.523,
+      "KDJ": 0.221,
+      "BOLL": 0.493,
+      "Volume": 0.43
+    },
+    "strategy": "range"
+  },
+  {
+    "symbol": "APE-USDT-SWAP",
+    "score": 0.3941,
+    "direction": "long",
+    "indicators": {
+      "RSI": 0.471,
+      "MACD": 0.578,
+      "KDJ": 0.304,
+      "BOLL": 0.465,
+      "Volume": 0.11
+    },
+    "strategy": "range"
+  },
+  {
+    "symbol": "GPS-USDT-SWAP",
+    "score": 0.3125,
+    "direction": "short",
+    "indicators": {
+      "RSI": 0.487,
+      "MACD": 0.257,
+      "KDJ": 0.417,
+      "BOLL": 0.463,
+      "Volume": 0.017
+    },
+    "strategy": "trend"
+  },
+  {
+    "symbol": "PI-USDT-SWAP",
+    "score": 0.2582,
+    "direction": "short",
+    "indicators": {
+      "RSI": 0.422,
+      "MACD": 0.23,
+      "KDJ": 0.051,
+      "BOLL": 0.337,
+      "Volume": 0.162
+    },
+    "strategy": "trend"
+  }
+]
