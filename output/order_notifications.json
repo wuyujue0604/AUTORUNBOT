@@ -1,9 +1,0 @@
-[
-  {
-    "symbol": "BTC-USDT-SWAP",
-    "action": "open_short",
-    "status": "fail",
-    "message": "⚠️ 金額或張數不足：BTC-USDT-SWAP",
-    "timestamp": "2025-06-14 10:45:51"
-  }
-]
