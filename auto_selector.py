@@ -1,235 +1,344 @@
 import os
 import json
 import time
+import threading
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-import pandas as pd
 
 from config import get_runtime_config, debug_mode, test_mode
 from selector_utils import (
     get_all_usdt_swap_symbols,
     get_ohlcv_batch,
     pass_pre_filter,
-    is_symbol_cooled_down,
     is_symbol_blocked,
-    load_latest_selection  # 確保讀取結果永遠為 dict
+    load_symbol_locks,
+    filter_candidates_by_position
 )
 from indicator_calculator import calculate_indicators
 from combination_logger import log_combination_result
+from state_manager import load_position_state
 import okx_client
-import state_manager
 from logger import log
 
-# === 📁 資料夾設定 ===
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 RESULT_DIR = os.path.join(BASE_DIR, "json_results")
 os.makedirs(RESULT_DIR, exist_ok=True)
 
-def load_position_state():
-    """
-    載入當前持倉狀態，格式為字典（防呆：僅接受 dict 結構）
-    """
-    path = os.path.join(RESULT_DIR, "position_status.json")
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if not isinstance(data, dict):
-                log(f"[錯誤] 持倉狀態格式錯誤，強制轉空 dict", level="ERROR")
-                return {}
-            return data
-    except Exception as e:
-        log(f"[錯誤] 無法讀取持倉狀態: {e}", level="ERROR")
-        return {}
+HISTORY_DB_PATH = os.path.join(RESULT_DIR, "selection_history.db")
+LATEST_SELECTION_DB_PATH = os.path.join(RESULT_DIR, "latest_selection.db")
 
-def load_symbol_locks():
-    """
-    載入冷卻池與封鎖標的資料（防呆：皆保證為 dict）
-    """
-    def read_json(path):
+_db_lock = threading.Lock()
+
+def get_db_connection(db_path):
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+def init_history_db():
+    with _db_lock:
+        with get_db_connection(HISTORY_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS selection_history (
+                    symbol TEXT PRIMARY KEY,
+                    consecutive INTEGER DEFAULT 0,
+                    confidence REAL DEFAULT 0,
+                    win_rate REAL DEFAULT 0.5,
+                    dynamic_weight TEXT DEFAULT '{}',
+                    last_seen INTEGER DEFAULT 0
+                )
+            ''')
+            conn.commit()
+
+def init_latest_selection_db():
+    with _db_lock:
+        with get_db_connection(LATEST_SELECTION_DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS latest_selection (
+                    symbol TEXT PRIMARY KEY,
+                    direction TEXT,
+                    confidence REAL,
+                    operation TEXT,
+                    indicators TEXT,
+                    indicator_status TEXT,
+                    timestamp INTEGER
+                )
+            ''')
+            conn.commit()
+
+def load_selection_history_cached():
+    with _db_lock:
         try:
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-                if isinstance(data, list):
-                    return {x: {} for x in data}
-            return {}
+            with get_db_connection(HISTORY_DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT symbol, consecutive, confidence, win_rate, dynamic_weight, last_seen FROM selection_history")
+                rows = cursor.fetchall()
         except Exception as e:
-            log(f"[錯誤] 讀取 {path} 失敗: {e}", level="ERROR")
+            log(f"[錯誤] 讀取歷史資料庫失敗: {e}", level="ERROR")
             return {}
-    cooldown = read_json(os.path.join(RESULT_DIR, "cooldown_pool.json"))
-    blocked = read_json(os.path.join(RESULT_DIR, "blocked_symbols.json"))
-    return cooldown, blocked
 
-def filter_candidates_by_position(candidates, position_state, config):
-    """
-    根據持倉狀態過濾候選標的，避免同標的多空重複持倉及持倉標的數量超限
-    """
-    holding_symbols_dirs = {(sym, pos['direction']) for sym, pos in position_state.items()}
-    holding_symbols = set(position_state.keys())
+    history = {}
+    for symbol, consecutive, confidence, win_rate, dw_json, last_seen in rows:
+        try:
+            dw = json.loads(dw_json)
+        except Exception:
+            dw = {}
+        history[symbol] = {
+            "consecutive": consecutive,
+            "confidence": confidence,
+            "win_rate": win_rate,
+            "dynamic_weight": dw,
+            "last_seen": last_seen
+        }
+    return history
 
-    debug_enabled = test_mode() or debug_mode()
+def save_selection_history_atomic(history):
+    with _db_lock:
+        try:
+            with get_db_connection(HISTORY_DB_PATH) as conn:
+                cursor = conn.cursor()
+                for symbol, record in history.items():
+                    dw_json = json.dumps(record.get("dynamic_weight", {}))
+                    cursor.execute('''
+                        INSERT INTO selection_history (symbol, consecutive, confidence, win_rate, dynamic_weight, last_seen)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(symbol) DO UPDATE SET
+                            consecutive=excluded.consecutive,
+                            confidence=excluded.confidence,
+                            win_rate=excluded.win_rate,
+                            dynamic_weight=excluded.dynamic_weight,
+                            last_seen=excluded.last_seen
+                    ''', (symbol, record.get("consecutive",0), record.get("confidence",0), record.get("win_rate",0.5), dw_json, record.get("last_seen",0)))
+                conn.commit()
+        except Exception as e:
+            log(f"[錯誤] 儲存歷史資料庫失敗: {e}", level="ERROR")
 
-    filtered = []
-    for c in candidates:
-        if not isinstance(c, dict) or 'symbol' not in c:
-            log(f"[錯誤] 候選清單元素格式錯誤或缺少symbol: {c}", level="ERROR")
-            continue
-        symbol = c['symbol']
-        direction = c.get('direction', 'buy')
-        opposite_direction = 'buy' if direction == 'sell' else 'sell'
+def save_latest_selection_db(candidates):
+    with _db_lock:
+        try:
+            with get_db_connection(LATEST_SELECTION_DB_PATH) as conn:
+                cursor = conn.cursor()
+                for c in candidates:
+                    cursor.execute('''
+                        INSERT INTO latest_selection 
+                        (symbol, direction, confidence, operation, indicators, indicator_status, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(symbol) DO UPDATE SET
+                            direction=excluded.direction,
+                            confidence=excluded.confidence,
+                            operation=excluded.operation,
+                            indicators=excluded.indicators,
+                            indicator_status=excluded.indicator_status,
+                            timestamp=excluded.timestamp
+                    ''', (
+                        c["symbol"],
+                        c["direction"],
+                        c["confidence"],
+                        c["operation"],
+                        json.dumps(c["indicators"]),
+                        json.dumps(c["indicator_status"]),
+                        c["timestamp"]
+                    ))
+                conn.commit()
+        except Exception as e:
+            log(f"[錯誤] 儲存最新選幣資料庫失敗: {e}", level="ERROR")
 
-        if (symbol, opposite_direction) in holding_symbols_dirs:
-            if debug_enabled:
-                log(f"[選幣過濾] {symbol} 方向{direction}因相反方向持倉存在，跳過", level="DEBUG")
-            continue
+def load_latest_selection_db():
+    with _db_lock:
+        try:
+            with get_db_connection(LATEST_SELECTION_DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT symbol, confidence FROM latest_selection")
+                rows = cursor.fetchall()
+                return {symbol: {"confidence": confidence} for symbol, confidence in rows}
+        except Exception as e:
+            log(f"[錯誤] 讀取最新選幣資料庫失敗: {e}", level="ERROR")
+            return {}
 
-        if symbol not in holding_symbols and len(holding_symbols) >= config.get("MAX_HOLDING_SYMBOLS", 6):
-            if debug_enabled:
-                log(f"[選幣過濾] 持倉已達上限，拒絕新標的 {symbol}", level="DEBUG")
-            continue
+def fetch_ohlcv_for_symbol(symbol, timeframe="1h", limit=100, config=None):
+    try:
+        df = get_ohlcv_batch([symbol], timeframe, limit, config)
+        return symbol, df.get(symbol, None)
+    except Exception as e:
+        log(f"[錯誤] 取得 {symbol} K線失敗: {e}")
+        return symbol, None
 
-        filtered.append(c)
-    return filtered
+def get_ohlcv_batch_multithread(symbols, timeframe="1h", limit=100, config=None, max_workers=4):
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_ohlcv_for_symbol, sym, timeframe, limit, config): sym for sym in symbols}
+        for future in futures:
+            sym = futures[future]
+            try:
+                symbol, df = future.result()
+                results[symbol] = df
+            except Exception as e:
+                log(f"[錯誤] 多線程取得 {sym} K線時異常: {e}")
+                results[sym] = None
+            time.sleep(0.05)
+    return results
 
-def process_symbol(symbol, ohlcv, previous_confidence, position_state, config, cooldown_pool, blocked_symbols):
-    """
-    單一標的完整篩選與決策流程，包含封鎖、冷卻、預篩、指標計算與操作決策
-    """
+def adjust_cooldown_time(symbol, history, base_cooldown=3600):
+    record = history.get(symbol, {})
+    consecutive_loss = record.get("consecutive_loss", 0)
+    consecutive_win = record.get("consecutive_win", 0)
+    if consecutive_loss >= 3:
+        return base_cooldown * 2
+    elif consecutive_win >= 3:
+        return base_cooldown // 2
+    else:
+        return base_cooldown
+
+def is_symbol_cooled_down_with_dynamic(symbol, cooldown_pool, config, history):
+    cooldown_info = cooldown_pool.get(symbol)
+    if not cooldown_info:
+        return False
+    base_duration = config.get("COOLDOWN_DURATION", 3600)
+    dynamic_duration = adjust_cooldown_time(symbol, history, base_duration)
+    elapsed = int(time.time()) - cooldown_info.get("timestamp", 0)
+    return elapsed < dynamic_duration
+
+def pass_liquidity_filter(symbol, ohlcv_df, min_vol_std=1.5):
+    if ohlcv_df is None or ohlcv_df.empty:
+        return False
+    vol_std = ohlcv_df['volume'].std()
+    if vol_std < min_vol_std:
+        if debug_mode():
+            log(f"[流動性過濾] {symbol} 成交量標準差過低 ({vol_std:.2f} < {min_vol_std})，過濾")
+        return False
+    return True
+
+def calc_confidence_boost(consecutive: int, base_confidence: float, max_conf: float, win_rate: float):
+    if consecutive <= 1:
+        return base_confidence
+    boost_base = 0.05
+    boost_max = 0.3
+    boost = boost_base + (boost_max - boost_base) * win_rate
+    total_boost = min(boost * (consecutive - 1), max_conf - base_confidence)
+    return min(base_confidence + total_boost, max_conf)
+
+def process_symbol(symbol, ohlcv, previous_confidence, position_state, config, cooldown_pool, blocked_symbols, history):
     if symbol in blocked_symbols or is_symbol_blocked(symbol, config):
-        if test_mode():
-            log(f"[TEST] {symbol} 被封鎖", level="DEBUG")
         return None
-    if is_symbol_cooled_down(symbol, cooldown_pool, config):
-        if test_mode():
-            log(f"[TEST] {symbol} 在冷卻中", level="DEBUG")
+    if is_symbol_cooled_down_with_dynamic(symbol, cooldown_pool, config, history):
         return None
     if not pass_pre_filter(symbol, ohlcv, config):
-        if test_mode():
-            log(f"[TEST] {symbol} 不符合預篩條件", level="DEBUG")
+        return None
+    if not pass_liquidity_filter(symbol, ohlcv, config.get("MIN_VOL_STD", 1.5)):
         return None
 
-    disabled = config.get("DISABLED_INDICATORS", [])
-    result = calculate_indicators(ohlcv, symbol, "1h", disabled)
+    result = calculate_indicators(ohlcv, symbol, "1h", config.get("DISABLED_INDICATORS", []))
     if not result or result.get("direction") == "none":
-        if test_mode():
-            log(f"[TEST] {symbol} 指標計算無明確方向", level="DEBUG")
         return None
 
     direction = result["direction"]
-    confidence = result["score"]
-    indicators = result["indicators"]
+    base_confidence = result["score"]
+    max_conf = config.get("MAX_CONFIDENCE_SCORE", 5.0)
 
-    # 信心加成，限制最大值100
-    if previous_confidence:
-        confidence = min(confidence * config.get("CONFIDENCE_BOOST_RATIO", 1.05), 100)
+    record = history.get(symbol, {})
+    consecutive = record.get("consecutive", 0)
+    win_rate = record.get("win_rate", 0.5)
+
+    dyn_weight = 1.0
+    dw = record.get("dynamic_weight")
+    if isinstance(dw, dict):
+        dyn_weight = dw.get(direction, 1.0)
+    elif isinstance(dw, (int, float)):
+        dyn_weight = float(dw)
+
+    boost_conf = calc_confidence_boost(consecutive, base_confidence, max_conf, win_rate)
+
+    weighted_confidence = round(boost_conf * dyn_weight, 2)
+    if weighted_confidence > max_conf:
+        weighted_confidence = max_conf
+
+    confidence = weighted_confidence
 
     price = okx_client.get_market_price(symbol)
     if price is None or price <= 0:
-        if test_mode():
-            log(f"[TEST] {symbol} 無法取得市價", level="DEBUG")
         return None
+
+    indicator_status = {ind_name: str(ind_val) for ind_name, ind_val in result.get("indicators", {}).items()}
+
+    log(f"[INFO] 紀錄指標組合：{symbol} (信心: {confidence})，連續被選中 {consecutive} 次，勝率 {win_rate}，動態權重 {dyn_weight}")
 
     pos = position_state.get(symbol, {})
     holding = pos.get("contracts", 0) > 0
     held_dir = pos.get("direction")
-    entry_price = pos.get("price", None)
+    entry_price = pos.get("price")
     add_times = pos.get("add_times", 0)
     reduce_times = pos.get("reduce_times", 0)
 
     unrealized_profit = 0
     pnl_ratio = 0
-    invested_capital = 0
-
     if entry_price and holding:
-        invested_capital = entry_price * pos.get("contracts", 0)
+        invested = entry_price * pos.get("contracts", 0)
         if held_dir == "buy":
             unrealized_profit = (price - entry_price) * pos.get("contracts", 0)
         elif held_dir == "sell":
             unrealized_profit = (entry_price - price) * pos.get("contracts", 0)
-        if invested_capital > 0:
-            pnl_ratio = unrealized_profit / invested_capital
+        if invested > 0:
+            pnl_ratio = unrealized_profit / invested
 
-    take_profit_value = config.get("TAKE_PROFIT_VALUE", 0.02)
+    take_profit_value = config.get("TAKE_PROFIT_VALUE", 0.2)
     stop_loss_ratio = config.get("STOP_LOSS_RATIO", -0.05)
-
-    if test_mode():
-        log(f"[TEST] {symbol} 未實現收益額: {unrealized_profit:.4f} USDT, 收益率: {pnl_ratio:.4%}", level="DEBUG")
-
-    threshold = config.get("OPEN_THRESHOLD", 3.5)
+    threshold = config.get("OPEN_THRESHOLD", 3.0)
     max_add = config.get("MAX_ADD_TIMES", 3)
     max_reduce = config.get("MAX_REDUCE_TIMES", 2)
     require_profit = config.get("REQUIRE_PROFIT_TO_CLOSE", True)
-    operation = None
 
-    # 新標的只要本次信心分數合格即可 open
+    operation = None
     if not holding and confidence >= threshold:
         operation = "open"
-    # 同方向持倉且信心增加且加倉次數未超過上限，加倉
     elif holding and held_dir == direction and confidence > pos.get("confidence", 0) and add_times < max_add:
         operation = "add"
     elif holding:
         if unrealized_profit >= take_profit_value:
             operation = "close"
         elif pnl_ratio <= stop_loss_ratio:
-            if reduce_times < max_reduce:
-                operation = "reduce"
-            else:
-                operation = "close"
+            operation = "reduce" if reduce_times < max_reduce else "close"
         elif confidence < threshold:
             if unrealized_profit > 0 or not require_profit:
                 operation = "close"
-            elif reduce_times < max_reduce:
-                operation = "reduce"
             else:
-                operation = "close"
-    else:
-        if test_mode():
-            log(f"[TEST] {symbol} 無進場動作，holding={holding}, conf={confidence}", level="DEBUG")
+                operation = "reduce" if reduce_times < max_reduce else "close"
 
     if not operation:
         return None
 
-    if test_mode():
-        log(f"[TEST] ✅ {symbol} 符合條件，操作: {operation}，信心: {confidence}", level="DEBUG")
-
     return {
         "symbol": symbol,
         "direction": direction,
-        "confidence": round(confidence, 2),
+        "confidence": confidence,
         "operation": operation,
-        "indicators": indicators,
-        "timestamp": int(time.time()),
+        "indicators": result["indicators"],
+        "indicator_status": indicator_status,
+        "timestamp": int(time.time())
     }
 
 def run_selector():
-    """
-    主選幣流程，包含所有資料讀取、防呆及結果輸出
-    """
+    init_history_db()
+    init_latest_selection_db()
+
+    start_time = time.time()
     config = get_runtime_config()
     all_symbols = get_all_usdt_swap_symbols()
     cooldown_pool, blocked_symbols = load_symbol_locks()
     position_state = load_position_state()
+    history = load_selection_history_cached()
 
-    prev_path = os.path.join(RESULT_DIR, "latest_selection.json")
-    previous_selection = {}
-    if os.path.exists(prev_path):
-        try:
-            previous_selection = load_latest_selection(prev_path)
-            # 防呆：信心轉為 float，非數值則忽略
-            previous_selection = {k: float(v.get("confidence", 0)) if v else 0 for k, v in previous_selection.items()}
-        except Exception as e:
-            log(f"[錯誤] 讀取歷史選幣結果失敗: {e}", level="ERROR")
+    previous_selection = load_latest_selection_db()
 
     BATCH_SIZE = 10
     candidates = []
+    current_seen = set()
 
     for i in range(0, len(all_symbols), BATCH_SIZE):
         batch = all_symbols[i:i + BATCH_SIZE]
         try:
-            ohlcv_data = get_ohlcv_batch(batch, "1H", limit=100, config=config)
+            ohlcv_data = get_ohlcv_batch_multithread(batch, "1H", limit=100, config=config, max_workers=4)
         except Exception as e:
             log(f"[錯誤] 批次取得 K 線失敗: {e}", level="ERROR")
             continue
@@ -237,35 +346,37 @@ def run_selector():
         for symbol in batch:
             ohlcv = ohlcv_data.get(symbol)
             if ohlcv is None or ohlcv.empty:
-                if test_mode():
-                    log(f"[TEST] {symbol} 沒有有效 K 線資料", level="DEBUG")
                 continue
-            try:
-                prev_score = previous_selection.get(symbol, None)
-                result = process_symbol(
-                    symbol, ohlcv, prev_score, position_state, config, cooldown_pool, blocked_symbols
-                )
-                if result:
-                    candidates.append(result)
-                    log_combination_result(result)
-            except Exception as e:
-                log(f"[錯誤] 處理 {symbol} 發生例外: {e}", level="ERROR")
+            prev_score = previous_selection.get(symbol, None)
+            result = process_symbol(symbol, ohlcv, prev_score, position_state, config, cooldown_pool, blocked_symbols, history)
+            if result:
+                candidates.append(result)
+                current_seen.add(symbol)
+                history.setdefault(result["symbol"], {})["confidence"] = result["confidence"]
+                log_combination_result(result)
         time.sleep(0.5)
 
-    if debug_mode():
-        log(f"[DEBUG] 進入 filter 前，合格標的數量: {len(candidates)}", level="DEBUG")
-        for c in candidates:
-            log(f"[DEBUG] 合格標的: {c['symbol']} 方向: {c['direction']} 信心: {c['confidence']}", level="DEBUG")
+    decay_ratio = config.get("CONFIDENCE_DECAY_RATIO", 0.9)
+    for symbol in set(list(history.keys()) + list(current_seen)):
+        if symbol in current_seen:
+            history.setdefault(symbol, {"consecutive": 0})
+            history[symbol]["consecutive"] = history[symbol].get("consecutive", 0) + 1
+            history[symbol]["last_seen"] = int(time.time())
+        else:
+            history.setdefault(symbol, {"consecutive": 0})
+            history[symbol]["consecutive"] = 0
+            if "confidence" in history[symbol]:
+                history[symbol]["confidence"] = max(0.0, round(history[symbol]["confidence"] * decay_ratio, 2))
+
+    save_selection_history_atomic(history)
 
     candidates = filter_candidates_by_position(candidates, position_state, config)
 
-    save_path = os.path.join(RESULT_DIR, "latest_selection.json")
-    try:
-        with open(save_path, "w", encoding="utf-8") as f:
-            json.dump(candidates, f, ensure_ascii=False, indent=2)
-        log(f"完成選出 {len(candidates)} 檔，儲存於 {save_path}，並寫入 log", level="INFO")
-    except Exception as e:
-        log(f"[錯誤] 寫入最新選幣結果失敗: {e}", level="ERROR")
+    save_latest_selection_db(candidates)
+    log(f"完成選出 {len(candidates)} 檔，並寫入最新選幣資料庫", level="INFO")
+
+    end_time = time.time()
+    log(f"[選幣] 執行時間: {round(end_time - start_time, 2)} 秒", level="INFO")
 
 if __name__ == "__main__":
     run_selector()
