@@ -2,6 +2,7 @@ import os
 import json
 import sqlite3
 from datetime import datetime, timedelta
+from collections import defaultdict
 from config import get_runtime_config
 from logger import log
 
@@ -10,14 +11,20 @@ RESULT_DIR = os.path.join(BASE_DIR, "json_results")
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 HISTORY_DB_PATH = os.path.join(RESULT_DIR, "selection_history.db")
+COMBO_DB_PATH = os.path.join(RESULT_DIR, "indicator_combination_log.db")
 
-def get_db_connection():
+def get_history_db_connection():
     conn = sqlite3.connect(HISTORY_DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
+def get_combo_db_connection():
+    conn = sqlite3.connect(COMBO_DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
 def init_history_db():
-    with get_db_connection() as conn:
+    with get_history_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS selection_history (
@@ -33,7 +40,7 @@ def init_history_db():
 
 def load_selection_history():
     init_history_db()
-    with get_db_connection() as conn:
+    with get_history_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT symbol, consecutive, confidence, win_rate, dynamic_weight, last_seen FROM selection_history")
         rows = cursor.fetchall()
@@ -55,7 +62,7 @@ def load_selection_history():
 
 def save_selection_history(history):
     init_history_db()
-    with get_db_connection() as conn:
+    with get_history_db_connection() as conn:
         cursor = conn.cursor()
         for symbol, record in history.items():
             dw_json = json.dumps(record.get("dynamic_weight", {}))
@@ -72,9 +79,43 @@ def save_selection_history(history):
                   record.get("win_rate",0.5), dw_json, record.get("last_seen",0)))
         conn.commit()
 
-def analyze_trade_performance(trades):
-    from collections import defaultdict
+def load_trade_actions():
+    """
+    從 indicator_combination_log.db 讀取近30天內的交易紀錄。
+    """
+    trades = []
+    cutoff_ts = int((datetime.now() - timedelta(days=30)).timestamp())
+    try:
+        with get_combo_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT symbol, direction, confidence, indicators, timestamp, log_timestamp
+                FROM indicator_combination_log
+                WHERE log_timestamp >= ?
+                ORDER BY log_timestamp DESC
+            ''', (cutoff_ts,))
+            rows = cursor.fetchall()
+            for row in rows:
+                sym, direction, confidence, indicators_json, ts, log_ts = row
+                try:
+                    indicators = json.loads(indicators_json)
+                except Exception:
+                    indicators = {}
 
+                trades.append({
+                    "symbol": sym,
+                    "direction": direction,
+                    "confidence": confidence,
+                    "indicators": indicators,
+                    "timestamp": ts,
+                    "log_timestamp": log_ts,
+                    # 需要時可擴充其他欄位
+                })
+    except Exception as e:
+        log(f"[錯誤] 讀取交易紀錄失敗: {e}", level="ERROR")
+    return trades
+
+def analyze_trade_performance(trades):
     stats = defaultdict(lambda: {"buy": {"win":0, "count":0, "total_pnl":0}, "sell": {"win":0, "count":0, "total_pnl":0}})
 
     cutoff_ts = int((datetime.now() - timedelta(days=30)).timestamp())
@@ -114,12 +155,8 @@ def analyze_trade_performance(trades):
     return results
 
 def update_dynamic_weights():
-    # 載入交易紀錄，若你原本是 jsonl 格式紀錄，可自行修改成從 SQLite 或其他地方載入
-    # 這裡仍假設 trade_actions.json 為 json list 格式，請自行調整成你資料庫的讀取
-    from combination_logger import load_trade_actions  # 你需要寫一個方法從資料庫或檔案讀trade logs
-    trades = load_trade_actions()
-
     history = load_selection_history()
+    trades = load_trade_actions()
 
     perf = analyze_trade_performance(trades)
 

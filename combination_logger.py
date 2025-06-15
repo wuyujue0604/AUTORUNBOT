@@ -2,7 +2,7 @@ import os
 import json
 import threading
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from config import get_runtime_config
 from logger import log
 
@@ -40,7 +40,7 @@ def init_combo_db():
             conn.commit()
 
 def record_performance(trade_log: dict):
-    # 這部分保留用 jsonl 寫入，保持不動
+    # 保留使用 jsonl 格式存交易績效，這段不動
     try:
         with open(os.path.join(RESULT_DIR, "performance_logs.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(trade_log, ensure_ascii=False) + "\n")
@@ -85,3 +85,42 @@ def log_combination_result(result: dict) -> bool:
     except Exception as e:
         log(f"[錯誤] 寫入指標組合紀錄失敗: {e}", level="ERROR")
         return False
+
+def load_trade_actions():
+    """
+    從 indicator_combination_log.db 讀取交易紀錄
+    並回傳 list[dict]，方便動態權重計算用
+    只回傳 近30 天內的交易
+    """
+    trades = []
+    cutoff_ts = int((datetime.now() - timedelta(days=30)).timestamp())
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT symbol, direction, confidence, indicators, timestamp, log_timestamp
+                FROM indicator_combination_log
+                WHERE log_timestamp >= ?
+                ORDER BY log_timestamp DESC
+            ''', (cutoff_ts,))
+            rows = cursor.fetchall()
+            for row in rows:
+                sym, direction, confidence, indicators_json, ts, log_ts = row
+                try:
+                    indicators = json.loads(indicators_json)
+                except Exception:
+                    indicators = {}
+
+                trade = {
+                    "symbol": sym,
+                    "direction": direction,
+                    "confidence": confidence,
+                    "indicators": indicators,
+                    "timestamp": ts,
+                    "log_timestamp": log_ts,
+                    # 你需要的其他欄位可自行擴充
+                }
+                trades.append(trade)
+    except Exception as e:
+        log(f"[錯誤] 讀取交易紀錄失敗: {e}", level="ERROR")
+    return trades
