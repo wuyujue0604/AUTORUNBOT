@@ -3,9 +3,11 @@ import time
 import json
 import traceback
 from config import get_runtime_config, debug_mode, test_mode
-import okx_client, state_manager, funding_manager, order_notifier
+import okx_client
+import state_manager
+import funding_manager
 from logger import log
-from order_notifier import log_trade_action, log_event
+from order_notifier import log_trade_action
 from combination_logger import record_performance  # 績效追蹤
 
 MAX_CONTRACTS_PER_ORDER_DEFAULT = 6000
@@ -38,13 +40,6 @@ def allocate_capital_for_position(symbol: str, direction: str, confidence: float
                                   long_count: int, short_count: int):
     """
     根據多單與空單數量比例分配可用本金，再估算合約張數與保證金
-    :param symbol: 合約名稱
-    :param direction: "buy" 或 "sell"
-    :param confidence: 信心分數 (0-100)
-    :param config: 系統設定字典
-    :param long_count: 當前選中多單標的數量
-    :param short_count: 當前選中空單標的數量
-    :return: (contracts, price, leverage)
     """
     price = okx_client.get_market_price(symbol)
     if price is None or price <= 0:
@@ -57,21 +52,18 @@ def allocate_capital_for_position(symbol: str, direction: str, confidence: float
 
     balance = okx_client.get_trade_balance()
 
-    # 預留10%保險金 buffer
     capital_buffer_ratio = float(config.get("CAPITAL_BUFFER_RATIO", 0.10))
     available = balance * (1 - capital_buffer_ratio)
 
     total_positions = long_count + short_count
     if total_positions == 0:
-        # 避免除以0，直接用全部可用本金
         allocated_capital = available
     else:
         if direction == "buy":
             allocated_capital = available * (long_count / total_positions)
         else:
-            # 空單保留本金和停損資金
             stop_loss_ratio = abs(float(config.get("STOP_LOSS_RATIO", -0.05)))
-            reserved_amount = (available / 2) * (1 + stop_loss_ratio)  # 空單預留本金+停損資金
+            reserved_amount = (available / 2) * (1 + stop_loss_ratio)
             free_amount = max(0, available - reserved_amount)
             allocated_capital = free_amount * (short_count / total_positions)
 
@@ -98,25 +90,12 @@ def allocate_capital_for_position(symbol: str, direction: str, confidence: float
 
 def estimate_contracts_and_margin(symbol: str, direction: str, confidence: float, config: dict):
     """
-    估算下單張數及保證金，改為使用 allocate_capital_for_position 取得依多空比例分配的資金。
-    需由外部呼叫時帶入最新多單與空單數量。
+    估算下單張數及保證金，改用最新選幣資料庫資料計算多空數量。
     """
-    # 讀取最新選幣結果，計算多空數量
-    path = os.path.join(os.path.dirname(__file__), "json_results", "latest_selection.json")
-    if not os.path.exists(path):
-        raise FileNotFoundError("最新選幣結果檔案不存在")
+    latest_selection = state_manager.load_latest_selection_db()
 
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        if isinstance(data, list):
-            entries = data
-        elif isinstance(data, dict):
-            entries = list(data.values())
-        else:
-            entries = []
-
-    long_count = sum(1 for e in entries if e.get("direction") == "buy")
-    short_count = sum(1 for e in entries if e.get("direction") == "sell")
+    long_count = sum(1 for s, d in latest_selection.items() if d.get("direction") == "buy")
+    short_count = sum(1 for s, d in latest_selection.items() if d.get("direction") == "sell")
 
     return allocate_capital_for_position(symbol, direction, confidence, config, long_count, short_count)
 
@@ -136,7 +115,7 @@ def send_order(symbol: str, direction: str, contracts: int, config: dict, reduce
 
             if not isinstance(resp, dict):
                 log(f"[錯誤] {symbol} 下單回傳格式非 dict，內容: {resp}", "ERROR")
-                log(f"[下單][重試] ({attempt}次): {symbol} {direction} {contracts} 張 失敗或格式錯誤，等待 {wait_time} 秒後重試")
+                log(f"[下單][重試] ({attempt}次): {symbol} {direction} {contracts} 張 失敗，等待 {wait_time} 秒後重試")
                 time.sleep(wait_time)
                 wait_time = min(wait_time * 2, 8)
                 continue
@@ -162,7 +141,7 @@ def send_order(symbol: str, direction: str, contracts: int, config: dict, reduce
                 log(f"[警告] {symbol} 下單失敗: 保證金不足，不再重試", "WARN")
                 return None
 
-            log(f"[下單][重試] ({attempt}次): {symbol} {direction} {contracts} 張 失敗或格式錯誤，等待 {wait_time} 秒後重試")
+            log(f"[下單][重試] ({attempt}次): {symbol} {direction} {contracts} 張 失敗，等待 {wait_time} 秒後重試")
             time.sleep(wait_time)
             wait_time = min(wait_time * 2, 8)
 
@@ -209,7 +188,7 @@ def get_order_params(position_direction: str, action: str):
 
 def wait_for_position_close(symbol: str, position_direction: str, timeout=5.0, interval=0.5):
     """
-    等待持倉被清空或方向改變，最多等待 timeout 秒
+    等待持倉被清空或方向改變，最多等待 timeout秒
     """
     start = time.time()
     while time.time() - start < timeout:
@@ -222,7 +201,7 @@ def wait_for_position_close(symbol: str, position_direction: str, timeout=5.0, i
     log(f"[警告] {symbol} 持倉未在 {timeout} 秒內清空")
     return False
 
-# 以下是主要四個交易操作函式，已調整使用新的estimate_contracts_and_margin
+# 以下是主要四個交易操作函式，已調整使用最新選幣資料庫與state_manager介面
 
 def try_close_position(entry: dict, config: dict):
     symbol = entry["symbol"]

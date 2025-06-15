@@ -1,5 +1,5 @@
 {
-  "DEBUG_MODE": false,
+  "DEBUG_MODE": true,
   "TEST_MODE": true,
 
   "OPEN_THRESHOLD": 3.0,

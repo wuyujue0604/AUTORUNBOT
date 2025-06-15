@@ -302,6 +302,23 @@ def reset_reserved_profit():
         except Exception as e:
             log(f"[錯誤] 重置保留獲利失敗: {e}\n{traceback.format_exc()}", level="ERROR")
 
+def load_latest_selection_db():
+    """
+    從 latest_selection.db 資料庫讀取最新選幣結果。
+    回傳格式為 dict: {symbol: {"confidence": confidence}, ...}
+    """
+    try:
+        with _lock:
+            with get_db_connection(LATEST_SELECTION_DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT symbol, confidence FROM latest_selection")
+                rows = cursor.fetchall()
+                return {symbol: {"confidence": confidence} for symbol, confidence in rows}
+    except Exception as e:
+        log(f"[錯誤] 讀取最新選幣資料庫失敗: {e}", level="ERROR")
+        return {}
+
+
 # --- 啟動時初始化資料表與資料夾 ---
 init_db()
 if debug_mode():
