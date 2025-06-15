@@ -1,126 +1,75 @@
 import os
 import json
 import threading
-import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 from config import get_runtime_config
 from logger import log
 
+# 設定結果儲存目錄及建立
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 RESULT_DIR = os.path.join(BASE_DIR, "json_results")
-os.makedirs(RESULT_DIR, exist_ok=True)
+os.makedirs(BASE_DIR, exist_ok=True)
 
-COMBO_DB_PATH = os.path.join(RESULT_DIR, "indicator_combination_log.db")
-
+# 多線程鎖，確保檔案存取安全
 _log_lock = threading.Lock()
 
-def get_db_connection():
-    conn = sqlite3.connect(COMBO_DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
-
-def init_combo_db():
-    with _log_lock:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS indicator_combination_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT,
-                    direction TEXT,
-                    confidence REAL,
-                    indicators TEXT,
-                    timestamp INTEGER,
-                    log_timestamp INTEGER
-                )
-            ''')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_symbol ON indicator_combination_log(symbol)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_log_timestamp ON indicator_combination_log(log_timestamp)')
-            conn.commit()
+performance_log_path = "json_results/performance_logs.jsonl"
+performance_lock = threading.Lock()
 
 def record_performance(trade_log: dict):
-    # 保留使用 jsonl 格式存交易績效，這段不動
     try:
-        with open(os.path.join(RESULT_DIR, "performance_logs.jsonl"), "a", encoding="utf-8") as f:
-            f.write(json.dumps(trade_log, ensure_ascii=False) + "\n")
+        with performance_lock:
+            with open(performance_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(trade_log, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"[績效紀錄錯誤] {e}")
 
 def log_combination_result(result: dict) -> bool:
+    """
+    紀錄每次選中的幣種與對應的指標組合，用於績效分析與學習。
+    1. 防呆：只允許 list 格式，若檔案不存在或格式錯誤自動重置為空。
+    2. 多線程鎖定，避免同時寫入錯亂。
+    3. 動態從配置讀取儲存路徑與最大紀錄數。
+    :param result: dict，包含 symbol, direction, confidence, indicators, timestamp 等欄位。
+    :return: bool，是否成功寫入。
+    """
     config = get_runtime_config()
-    init_combo_db()
-    log_entry = {
+    log_file = os.path.join(RESULT_DIR, config.get("COMBINATION_LOG_PATH", "indicator_combination_log.json"))
+
+    entry = {
         "symbol": result.get("symbol"),
         "direction": result.get("direction"),
         "confidence": result.get("confidence"),
-        "indicators": json.dumps(result.get("indicators", {}), ensure_ascii=False),
+        "indicators": result.get("indicators", {}),
         "timestamp": result.get("timestamp"),
         "log_timestamp": int(datetime.now().timestamp())
     }
 
     try:
         with _log_lock:
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO indicator_combination_log
-                    (symbol, direction, confidence, indicators, timestamp, log_timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (log_entry["symbol"], log_entry["direction"], log_entry["confidence"], log_entry["indicators"], log_entry["timestamp"], log_entry["log_timestamp"]))
+            if os.path.exists(log_file):
+                with open(log_file, "r", encoding="utf-8") as f:
+                    try:
+                        data = json.load(f)
+                        if not isinstance(data, list):
+                            log(f"[警告] 指標組合紀錄檔非 list，將被重置", level="WARN")
+                            data = []
+                    except Exception as e:
+                        log(f"[錯誤] 解析指標組合紀錄失敗: {e}", level="ERROR")
+                        data = []
+            else:
+                data = []
 
-                max_records = config.get("MAX_COMBINATION_LOGS", 5000)
-                cursor.execute(f'''
-                    DELETE FROM indicator_combination_log 
-                    WHERE id NOT IN (
-                        SELECT id FROM indicator_combination_log 
-                        ORDER BY log_timestamp DESC LIMIT ?
-                    )
-                ''', (max_records,))
+            max_records = config.get("MAX_COMBINATION_LOGS", 5000)
+            data.append(entry)
+            if len(data) > max_records:
+                data = data[-max_records:]  # 只保留最新 N 筆
 
-                conn.commit()
+            with open(log_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
 
-            log(f"[INFO] 紀錄指標組合：{log_entry['symbol']} (信心: {log_entry['confidence']})", level="INFO")
+            log(f"[INFO] 紀錄指標組合：{entry['symbol']} (信心: {entry['confidence']})", level="INFO")
             return True
     except Exception as e:
         log(f"[錯誤] 寫入指標組合紀錄失敗: {e}", level="ERROR")
         return False
-
-def load_trade_actions():
-    """
-    從 indicator_combination_log.db 讀取交易紀錄
-    並回傳 list[dict]，方便動態權重計算用
-    只回傳 近30 天內的交易
-    """
-    trades = []
-    cutoff_ts = int((datetime.now() - timedelta(days=30)).timestamp())
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT symbol, direction, confidence, indicators, timestamp, log_timestamp
-                FROM indicator_combination_log
-                WHERE log_timestamp >= ?
-                ORDER BY log_timestamp DESC
-            ''', (cutoff_ts,))
-            rows = cursor.fetchall()
-            for row in rows:
-                sym, direction, confidence, indicators_json, ts, log_ts = row
-                try:
-                    indicators = json.loads(indicators_json)
-                except Exception:
-                    indicators = {}
-
-                trade = {
-                    "symbol": sym,
-                    "direction": direction,
-                    "confidence": confidence,
-                    "indicators": indicators,
-                    "timestamp": ts,
-                    "log_timestamp": log_ts,
-                    # 你需要的其他欄位可自行擴充
-                }
-                trades.append(trade)
-    except Exception as e:
-        log(f"[錯誤] 讀取交易紀錄失敗: {e}", level="ERROR")
-    return trades

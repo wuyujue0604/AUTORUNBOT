@@ -3,11 +3,8 @@ import time
 import json
 import traceback
 from config import get_runtime_config, debug_mode, test_mode
-import okx_client
-import state_manager
-import funding_manager
+import okx_client, state_manager, funding_manager, order_notifier
 from logger import log
-from order_notifier import log_trade_action
 from combination_logger import record_performance  # 績效追蹤
 
 MAX_CONTRACTS_PER_ORDER_DEFAULT = 6000
@@ -20,6 +17,7 @@ def calculate_investment_ratio(confidence: float, config: dict) -> float:
     max_ratio = float(config.get("MAX_SINGLE_POSITION_RATIO", 0.15))
     ratio = (confidence / 100.0) * max_ratio
     return max(min_ratio, min(ratio, max_ratio))
+
 
 def get_order_status(symbol: str, ord_id: str):
     """
@@ -36,10 +34,12 @@ def get_order_status(symbol: str, ord_id: str):
         log(f"[錯誤][訂單查詢] {symbol} ordId={ord_id} 查詢失敗: {e}")
         return None
 
-def allocate_capital_for_position(symbol: str, direction: str, confidence: float, config: dict,
-                                  long_count: int, short_count: int):
+
+def estimate_contracts_and_margin(symbol: str, direction: str, confidence: float, config: dict):
     """
-    根據多單與空單數量比例分配可用本金，再估算合約張數與保證金
+    【優化】估算可下單張數及預估保證金，動態限制最大槓桿（由 config 參數控制），
+    並且加入資金緩衝，確保不會超槓桿或超出可用資金。
+    空單時強制保留本金+停損資金，不允許動用這部分。
     """
     price = okx_client.get_market_price(symbol)
     if price is None or price <= 0:
@@ -47,33 +47,28 @@ def allocate_capital_for_position(symbol: str, direction: str, confidence: float
 
     lev_long, lev_short = okx_client.get_leverage(symbol)
     max_leverage = float(config.get("MAX_LEVERAGE_LIMIT", 10))
+
     leverage = lev_long if direction == "buy" else lev_short
     leverage = min(leverage, max_leverage)
 
     balance = okx_client.get_trade_balance()
+    cap_buf = float(config.get("CAPITAL_BUFFER_RATIO", 0.10))
 
-    capital_buffer_ratio = float(config.get("CAPITAL_BUFFER_RATIO", 0.10))
-    available = balance * (1 - capital_buffer_ratio)
-
-    total_positions = long_count + short_count
-    if total_positions == 0:
-        allocated_capital = available
+    if direction == "sell":
+        stop_loss_ratio = abs(float(config.get("STOP_LOSS_RATIO", -0.05)))
+        reserved_amount = price * confidence + price * confidence * stop_loss_ratio
+        available = max(0, balance - reserved_amount)
+        available = available * (1 - cap_buf)
     else:
-        if direction == "buy":
-            allocated_capital = available * (long_count / total_positions)
-        else:
-            stop_loss_ratio = abs(float(config.get("STOP_LOSS_RATIO", -0.05)))
-            reserved_amount = (available / 2) * (1 + stop_loss_ratio)
-            free_amount = max(0, available - reserved_amount)
-            allocated_capital = free_amount * (short_count / total_positions)
+        available = balance * (1 - cap_buf)
 
     ratio = calculate_investment_ratio(confidence, config)
-    budget = allocated_capital * ratio
+    budget = available * ratio
 
-    margin_per_contract = price / leverage * float(config.get("ORDER_MARGIN_BUFFER", 1.10))
+    margin_per = price / leverage * float(config.get("ORDER_MARGIN_BUFFER", 1.10))
 
-    max_possible_contracts = int(allocated_capital / margin_per_contract)
-    contracts = int(budget / margin_per_contract)
+    max_possible_contracts = int(available / margin_per)
+    contracts = int(budget / margin_per)
 
     contracts = max(1, min(
         contracts,
@@ -82,26 +77,17 @@ def allocate_capital_for_position(symbol: str, direction: str, confidence: float
     ))
 
     if debug_mode():
-        log(f"[DEBUG][資金分配估算] {symbol} 方向={direction} 信心={confidence:.2f} "
-            f"allocated_capital={allocated_capital:.2f}, budget={budget:.2f}, price={price:.4f}, leverage={leverage:.2f}, "
-            f"margin_per_contract={margin_per_contract:.6f}, contracts={contracts}")
+        log(f"[DEBUG][下單估算] {symbol} 方向={direction} 信心={confidence:.2f}, 預算={budget:.2f}, "
+            f"價格={price:.4f}, 槓桿={leverage:.2f}, 單張保證金={margin_per:.6f}, "
+            f"最大可下張數={max_possible_contracts}, 最終張數={contracts}")
 
     return contracts, price, leverage
 
-def estimate_contracts_and_margin(symbol: str, direction: str, confidence: float, config: dict):
-    """
-    估算下單張數及保證金，改用最新選幣資料庫資料計算多空數量。
-    """
-    latest_selection = state_manager.load_latest_selection_db()
-
-    long_count = sum(1 for s, d in latest_selection.items() if d.get("direction") == "buy")
-    short_count = sum(1 for s, d in latest_selection.items() if d.get("direction") == "sell")
-
-    return allocate_capital_for_position(symbol, direction, confidence, config, long_count, short_count)
 
 def send_order(symbol: str, direction: str, contracts: int, config: dict, reduce_only=False):
     """
-    發送下單請求，多次重試與錯誤處理，等待訂單成交確認。
+    【優化】發送下單請求，包含多次重試、指數退避、錯誤回傳格式檢查，
+    並且等待訂單狀態確認是否成交。
     """
     try:
         if test_mode():
@@ -115,7 +101,7 @@ def send_order(symbol: str, direction: str, contracts: int, config: dict, reduce
 
             if not isinstance(resp, dict):
                 log(f"[錯誤] {symbol} 下單回傳格式非 dict，內容: {resp}", "ERROR")
-                log(f"[下單][重試] ({attempt}次): {symbol} {direction} {contracts} 張 失敗，等待 {wait_time} 秒後重試")
+                log(f"[下單][重試] ({attempt}次): {symbol} {direction} {contracts} 張 失敗或格式錯誤，等待 {wait_time} 秒後重試")
                 time.sleep(wait_time)
                 wait_time = min(wait_time * 2, 8)
                 continue
@@ -141,7 +127,7 @@ def send_order(symbol: str, direction: str, contracts: int, config: dict, reduce
                 log(f"[警告] {symbol} 下單失敗: 保證金不足，不再重試", "WARN")
                 return None
 
-            log(f"[下單][重試] ({attempt}次): {symbol} {direction} {contracts} 張 失敗，等待 {wait_time} 秒後重試")
+            log(f"[下單][重試] ({attempt}次): {symbol} {direction} {contracts} 張 失敗或格式錯誤，等待 {wait_time} 秒後重試")
             time.sleep(wait_time)
             wait_time = min(wait_time * 2, 8)
 
@@ -152,10 +138,8 @@ def send_order(symbol: str, direction: str, contracts: int, config: dict, reduce
         log(f"[例外][下單] {symbol} send_order錯誤: {e}\n{traceback.format_exc()}", "ERROR")
         return None
 
+
 def check_position_conflict_and_limit(symbol: str, direction: str, position_state: dict, max_symbols: int) -> bool:
-    """
-    風控檢查，避免持倉方向衝突與持倉標的數超限
-    """
     try:
         holding_symbols_dirs = {(sym, pos['direction']) for sym, pos in position_state.items()}
         holding_symbols = set(position_state.keys())
@@ -174,10 +158,8 @@ def check_position_conflict_and_limit(symbol: str, direction: str, position_stat
         log(f"[例外][風控] check_position_conflict_and_limit錯誤: {e}\n{traceback.format_exc()}", "ERROR")
         return False
 
+
 def get_order_params(position_direction: str, action: str):
-    """
-    根據操作類型取得下單方向及是否為reduceOnly
-    """
     if action in ("open", "add"):
         return position_direction, False
     elif action in ("reduce", "close"):
@@ -186,10 +168,8 @@ def get_order_params(position_direction: str, action: str):
     else:
         raise ValueError(f"未知操作類型: {action}")
 
+
 def wait_for_position_close(symbol: str, position_direction: str, timeout=5.0, interval=0.5):
-    """
-    等待持倉被清空或方向改變，最多等待 timeout秒
-    """
     start = time.time()
     while time.time() - start < timeout:
         pos = state_manager.get_position_state(symbol)
@@ -201,7 +181,6 @@ def wait_for_position_close(symbol: str, position_direction: str, timeout=5.0, i
     log(f"[警告] {symbol} 持倉未在 {timeout} 秒內清空")
     return False
 
-# 以下是主要四個交易操作函式，已調整使用最新選幣資料庫與state_manager介面
 
 def try_close_position(entry: dict, config: dict):
     symbol = entry["symbol"]
@@ -258,16 +237,9 @@ def try_close_position(entry: dict, config: dict):
                 "order_id": result.get("ordId") if isinstance(result, dict) else "",
             }
             state_manager.record_trade_log(log_data)
-            log_trade_action(
-                log_data["symbol"],
-                log_data["operation"],
-                log_data["direction"],
-                log_data["confidence"],
-                log_data["price"],
-                log_data["contracts"],
-                log_data.get("pnl")
-            )
+            order_notifier.queue_trade(log_data)
 
+            # 紀錄績效追蹤
             weights = {
                 "TF_WEIGHT_1H": float(config.get("TF_WEIGHT_1H", 0.7)),
                 "TF_WEIGHT_15M": 1 - float(config.get("TF_WEIGHT_1H", 0.7)),
@@ -280,6 +252,7 @@ def try_close_position(entry: dict, config: dict):
                 "weights": weights,
                 "timestamp": timestamp,
             }
+            from combination_logger import record_performance
             record_performance(perf_log)
 
             if pnl > 0:
@@ -299,6 +272,7 @@ def try_close_position(entry: dict, config: dict):
         log(f"[例外][平倉] {symbol} 平倉異常: {e}\n{traceback.format_exc()}", "ERROR")
         return None
 
+
 def try_build_position(entry: dict, config: dict):
     symbol = entry["symbol"]
     position_direction = entry["direction"]
@@ -310,7 +284,6 @@ def try_build_position(entry: dict, config: dict):
     long_qty = current_pos.get("contracts", 0) if current_pos.get("direction") == "buy" else 0
     short_qty = current_pos.get("contracts", 0) if current_pos.get("direction") == "sell" else 0
 
-    # 若方向相反持倉存在，先平倉
     if position_direction == "buy" and short_qty > 0:
         log(f"[自動平倉] {symbol} 有空單持倉({short_qty}張)，先平空單")
         try_close_position({"symbol": symbol}, config)
@@ -360,14 +333,7 @@ def try_build_position(entry: dict, config: dict):
             "response": result,
         }
         state_manager.record_trade_log(trade_log)
-        log_trade_action(
-            trade_log["symbol"],
-            trade_log["operation"],
-            trade_log["direction"],
-            trade_log["confidence"],
-            trade_log["price"],
-            trade_log["contracts"]
-        )
+        order_notifier.queue_trade(trade_log)
 
         weights = {
             "TF_WEIGHT_1H": float(config.get("TF_WEIGHT_1H", 0.7)),
@@ -381,12 +347,14 @@ def try_build_position(entry: dict, config: dict):
             "weights": weights,
             "timestamp": int(time.time()),
         }
+        from combination_logger import record_performance
         record_performance(perf_log)
 
         return trade_log
     else:
         log(f"[錯誤][建倉] {symbol} 建倉下單失敗", "ERROR")
         return None
+
 
 def try_add_position(entry: dict, config: dict):
     symbol = entry["symbol"]
@@ -439,14 +407,7 @@ def try_add_position(entry: dict, config: dict):
             "response": result,
         }
         state_manager.record_trade_log(trade_log)
-        log_trade_action(
-            trade_log["symbol"],
-            trade_log["operation"],
-            trade_log["direction"],
-            trade_log["confidence"],
-            trade_log["price"],
-            trade_log["contracts"]
-        )
+        order_notifier.queue_trade(trade_log)
 
         weights = {
             "TF_WEIGHT_1H": float(config.get("TF_WEIGHT_1H", 0.7)),
@@ -460,12 +421,14 @@ def try_add_position(entry: dict, config: dict):
             "weights": weights,
             "timestamp": int(time.time()),
         }
+        from combination_logger import record_performance
         record_performance(perf_log)
 
         return trade_log
     else:
         log(f"[錯誤][加倉] {symbol} 加倉下單失敗", "ERROR")
         return None
+
 
 def try_reduce_position(entry: dict, config: dict):
     symbol = entry["symbol"]
@@ -476,11 +439,11 @@ def try_reduce_position(entry: dict, config: dict):
 
     position_direction = current["direction"]
 
-    # 空單禁止減倉改直接平倉
     if position_direction == "sell":
-        log(f"[拒絕][減倉] {symbol} 空單不允許減倉，請直接平倉", "WARN")
-        entry = {"symbol": symbol}
+        log(f"[拒絕][減倉] {symbol} 空單不允許減倉，已自動轉為平倉", "WARN")
+        entry = {"symbol": symbol, "exit_reason": "空單減倉自動轉平倉"}
         return try_close_position(entry, config)
+
 
     contracts = max(1, current["contracts"] // 2)
     price = okx_client.get_market_price(symbol)
@@ -530,15 +493,7 @@ def try_reduce_position(entry: dict, config: dict):
                 "order_id": order_id,
             }
             state_manager.record_trade_log(log_data)
-            log_trade_action(
-                log_data["symbol"],
-                log_data["operation"],
-                log_data["direction"],
-                log_data["confidence"],
-                log_data["price"],
-                log_data["contracts"],
-                log_data.get("pnl")
-            )
+            order_notifier.queue_trade(log_data)
 
             weights = {
                 "TF_WEIGHT_1H": float(config.get("TF_WEIGHT_1H", 0.7)),
@@ -552,6 +507,7 @@ def try_reduce_position(entry: dict, config: dict):
                 "weights": weights,
                 "timestamp": int(time.time()),
             }
+            from combination_logger import record_performance
             record_performance(perf_log)
 
             if pnl > 0:
@@ -565,19 +521,14 @@ def try_reduce_position(entry: dict, config: dict):
                         state_manager.reset_reserved_profit()
             return log_data
         else:
-            log(f"[錯誤][減倉] {symbol} 減倉下單失敗", "ERROR")
+            log(f"[減倉][失敗] {symbol} 減倉下單失敗", "ERROR")
             return None
     except Exception as e:
         log(f"[例外][減倉] {symbol} 減倉異常: {e}\n{traceback.format_exc()}", "ERROR")
         return None
 
+
 def handle_removed_position(symbol: str, pos: dict, latest_selection: dict, config: dict) -> bool:
-    """
-    持倉同步處理：
-    1. 持倉標的不在最新選幣清單，且已獲利或不強制獲利，直接平倉。
-    2. 否則嘗試減倉，超過最大減倉次數強制平倉。
-    3. 信心下降時同理減倉或平倉。
-    """
     reason = ""
     latest = latest_selection.get(symbol)
     current_conf = float(pos.get("confidence", 0))
@@ -593,13 +544,9 @@ def handle_removed_position(symbol: str, pos: dict, latest_selection: dict, conf
 
     ts = int(time.time())
 
-    pnl = 0  # 初始化pnl
-
     if not latest:
         require_profit = config.get("REQUIRE_PROFIT_TO_CLOSE", True)
         profit = (price - entry_price) if direction == "buy" else (entry_price - price)
-        pnl = profit
-
         if profit > 0 or not require_profit:
             reason = "不在選幣名單，已獲利或允許虧損"
             entry = {"symbol": symbol}
@@ -615,65 +562,24 @@ def handle_removed_position(symbol: str, pos: dict, latest_selection: dict, conf
                     "operation": "close",
                     "timestamp": ts,
                     "log_timestamp": ts,
-                    "result_emoji": "📈" if pnl > 0 else "📉",
+                    "result_emoji": "📈" if profit > 0 else "📉",
                     "exit_reason": reason
                 }
                 state_manager.record_trade_log(log_data)
-                log_trade_action(
-                    log_data["symbol"],
-                    log_data["operation"],
-                    log_data["direction"],
-                    log_data["confidence"],
-                    log_data["price"],
-                    log_data["contracts"],
-                    log_data.get("pnl")
-                )
+                order_notifier.queue_trade(log_data)
                 return True
             else:
                 log(f"[錯誤][持倉同步] {symbol} 平倉下單失敗，稍後重試", "ERROR")
                 return False
 
         if reduce_times < config.get("MAX_REDUCE_TIMES", 2):
-            if direction == "sell":
-                # 空單禁止減倉，改直接平倉
-                log(f"[拒絕][減倉] {symbol} 空單不允許減倉，請直接平倉", "WARN")
-                entry = {"symbol": symbol}
-                success = try_close_position(entry, config)
-                if success:
-                    state_manager.remove_position(symbol)
-                    log_data = {
-                        "symbol": symbol,
-                        "direction": direction,
-                        "contracts": contracts,
-                        "price": price,
-                        "confidence": current_conf,
-                        "operation": "close",
-                        "timestamp": ts,
-                        "log_timestamp": ts,
-                        "result_emoji": "📈" if pnl > 0 else "📉",
-                        "exit_reason": "空單禁止減倉，直接平倉"
-                    }
-                    state_manager.record_trade_log(log_data)
-                    log_trade_action(
-                        log_data["symbol"],
-                        log_data["operation"],
-                        log_data["direction"],
-                        log_data["confidence"],
-                        log_data["price"],
-                        log_data["contracts"],
-                        log_data.get("pnl")
-                    )
-                    return True
-                else:
-                    log(f"[錯誤][持倉同步] {symbol} 空單強制平倉失敗，稍後重試", "ERROR")
-                    return False
-
             reduce_qty = max(1, contracts // 2)
             reason = "不在名單但未獲利，嘗試減倉"
             entry = {"symbol": symbol}
             success = try_reduce_position(entry, config)
             if success:
                 state_manager.update_position_after_reduce(symbol, reduce_qty)
+                pnl = profit
                 log_data = {
                     "symbol": symbol,
                     "direction": direction,
@@ -687,15 +593,7 @@ def handle_removed_position(symbol: str, pos: dict, latest_selection: dict, conf
                     "exit_reason": reason
                 }
                 state_manager.record_trade_log(log_data)
-                log_trade_action(
-                    log_data["symbol"],
-                    log_data["operation"],
-                    log_data["direction"],
-                    log_data["confidence"],
-                    log_data["price"],
-                    log_data["contracts"],
-                    log_data.get("pnl")
-                )
+                order_notifier.queue_trade(log_data)
                 return True
             else:
                 log(f"[錯誤][持倉同步] {symbol} 減倉下單失敗，稍後重試", "ERROR")
@@ -706,6 +604,7 @@ def handle_removed_position(symbol: str, pos: dict, latest_selection: dict, conf
             success = try_close_position(entry, config)
             if success:
                 state_manager.remove_position(symbol)
+                pnl = profit
                 log_data = {
                     "symbol": symbol,
                     "direction": direction,
@@ -719,15 +618,7 @@ def handle_removed_position(symbol: str, pos: dict, latest_selection: dict, conf
                     "exit_reason": reason
                 }
                 state_manager.record_trade_log(log_data)
-                log_trade_action(
-                    log_data["symbol"],
-                    log_data["operation"],
-                    log_data["direction"],
-                    log_data["confidence"],
-                    log_data["price"],
-                    log_data["contracts"],
-                    log_data.get("pnl")
-                )
+                order_notifier.queue_trade(log_data)
                 return True
             else:
                 log(f"[錯誤][持倉同步] {symbol} 強制平倉下單失敗，稍後重試", "ERROR")
@@ -736,40 +627,6 @@ def handle_removed_position(symbol: str, pos: dict, latest_selection: dict, conf
     new_conf = float(latest.get("confidence", 0))
     if new_conf < current_conf:
         if reduce_times < config.get("MAX_REDUCE_TIMES", 2):
-            if direction == "sell":
-                # 空單禁止減倉，改直接平倉
-                log(f"[拒絕][減倉] {symbol} 空單不允許減倉，請直接平倉", "WARN")
-                entry = {"symbol": symbol}
-                success = try_close_position(entry, config)
-                if success:
-                    state_manager.remove_position(symbol)
-                    log_data = {
-                        "symbol": symbol,
-                        "direction": direction,
-                        "contracts": contracts,
-                        "price": price,
-                        "confidence": current_conf,
-                        "operation": "close",
-                        "timestamp": ts,
-                        "log_timestamp": ts,
-                        "result_emoji": "📈" if pnl > 0 else "📉",
-                        "exit_reason": "空單禁止減倉，直接平倉"
-                    }
-                    state_manager.record_trade_log(log_data)
-                    log_trade_action(
-                        log_data["symbol"],
-                        log_data["operation"],
-                        log_data["direction"],
-                        log_data["confidence"],
-                        log_data["price"],
-                        log_data["contracts"],
-                        log_data.get("pnl")
-                    )
-                    return True
-                else:
-                    log(f"[錯誤][持倉同步] {symbol} 空單強制平倉失敗，稍後重試", "ERROR")
-                    return False
-
             reduce_qty = max(1, contracts // 2)
             reason = "信心下降，嘗試減倉"
             entry = {"symbol": symbol}
@@ -790,15 +647,7 @@ def handle_removed_position(symbol: str, pos: dict, latest_selection: dict, conf
                     "exit_reason": reason
                 }
                 state_manager.record_trade_log(log_data)
-                log_trade_action(
-                    log_data["symbol"],
-                    log_data["operation"],
-                    log_data["direction"],
-                    log_data["confidence"],
-                    log_data["price"],
-                    log_data["contracts"],
-                    log_data.get("pnl")
-                )
+                order_notifier.queue_trade(log_data)
                 return True
             else:
                 log(f"[錯誤][持倉同步] {symbol} 減倉下單失敗，稍後重試", "ERROR")
@@ -823,15 +672,7 @@ def handle_removed_position(symbol: str, pos: dict, latest_selection: dict, conf
                     "exit_reason": reason
                 }
                 state_manager.record_trade_log(log_data)
-                log_trade_action(
-                    log_data["symbol"],
-                    log_data["operation"],
-                    log_data["direction"],
-                    log_data["confidence"],
-                    log_data["price"],
-                    log_data["contracts"],
-                    log_data.get("pnl")
-                )
+                order_notifier.queue_trade(log_data)
                 return True
             else:
                 log(f"[錯誤][持倉同步] {symbol} 平倉下單失敗，稍後重試", "ERROR")
@@ -839,10 +680,8 @@ def handle_removed_position(symbol: str, pos: dict, latest_selection: dict, conf
 
     return True
 
+
 def run_order_executor():
-    """
-    主控調度函式，讀取最新選幣結果並依指令執行下單。
-    """
     config = get_runtime_config()
     path = os.path.join(os.path.dirname(__file__), "json_results", "latest_selection.json")
     if not os.path.exists(path):

@@ -3,173 +3,107 @@ import json
 import threading
 import time
 import traceback
-import sqlite3
 from config import get_runtime_config, debug_mode
 from logger import log
 
-# 定義結果資料夾路徑
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-RESULT_DIR = os.path.join(BASE_DIR, "json_results")
-os.makedirs(RESULT_DIR, exist_ok=True)
+# 全域鎖，確保多執行緒時讀寫持倉安全
+lock = threading.Lock()
 
-# SQLite DB 路徑設定
-STATE_DB_PATH = os.path.join(RESULT_DIR, "state_manager.db")
-LATEST_SELECTION_DB_PATH = os.path.join(RESULT_DIR, "latest_selection.db")
+# 系統配置動態讀取
+def _get_config():
+    return get_runtime_config()
 
-# 執行緒鎖，確保多執行緒安全
-_lock = threading.Lock()
+# 持倉狀態檔案路徑（動態讀取，提升彈性）
+def _get_position_state_path():
+    config = _get_config()
+    return config.get("POSITION_STATE_PATH", "json_results/position_status.json")
 
-def get_db_connection(db_path=STATE_DB_PATH):
-    """
-    取得 SQLite 連線並啟用 WAL 模式提升性能
-    """
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
+# 交易紀錄檔案路徑（動態讀取）
+def _get_trade_log_path():
+    config = _get_config()
+    return config.get("TRADE_LOG_PATH", "json_results/trade_logs.jsonl")
 
-def init_db():
-    """
-    初始化資料庫，建立必要的資料表
-    """
-    with _lock:
-        with get_db_connection(STATE_DB_PATH) as conn:
-            cursor = conn.cursor()
-            # 建立持倉狀態表
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS position_state (
-                    symbol TEXT PRIMARY KEY,
-                    direction TEXT,
-                    contracts INTEGER,
-                    price REAL,
-                    confidence REAL,
-                    add_times INTEGER DEFAULT 0,
-                    reduce_times INTEGER DEFAULT 0,
-                    extra TEXT DEFAULT '{}'
-                )
-            ''')
-            # 建立交易紀錄表
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS trade_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT,
-                    direction TEXT,
-                    pnl REAL,
-                    operation TEXT,
-                    timestamp INTEGER,
-                    log_timestamp INTEGER
-                )
-            ''')
-            # 建立保留獲利表（單筆）
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS reserved_profit (
-                    id INTEGER PRIMARY KEY CHECK(id=1),
-                    reserved REAL DEFAULT 0
-                )
-            ''')
-            conn.commit()
-        # 初始化最新選幣資料庫表
-        with get_db_connection(LATEST_SELECTION_DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS latest_selection (
-                    symbol TEXT PRIMARY KEY,
-                    direction TEXT,
-                    confidence REAL,
-                    operation TEXT,
-                    indicators TEXT,
-                    indicator_status TEXT,
-                    timestamp INTEGER
-                )
-            ''')
-            conn.commit()
+# 保留獲利檔案路徑（動態讀取）
+def _get_profit_path():
+    config = _get_config()
+    return config.get("PROFIT_PATH", "json_results/profit_reserved.json")
 
-# ------------------- 持倉狀態操作 -------------------
+# --- 初始化資料夾(啟動時呼叫一次即可) ---
+def init_data_dirs():
+    for path in [_get_position_state_path(), _get_trade_log_path(), _get_profit_path()]:
+        dirpath = os.path.dirname(path)
+        if not os.path.exists(dirpath):
+            os.makedirs(dirpath)
+            if debug_mode():
+                log(f"[DEBUG] 建立資料夾: {dirpath}", level="DEBUG")
 
+# --- 讀取所有持倉狀態，加入快取機制降低I/O ---
 _position_cache = None
 _position_cache_time = 0
-
 def load_position_state(force_reload=False):
-    """
-    從資料庫讀取持倉狀態，使用快取避免頻繁 I/O，快取有效期 5 秒
-    """
     global _position_cache, _position_cache_time
+    path = _get_position_state_path()
     now = time.time()
+    # 5秒快取有效期
     if not force_reload and _position_cache is not None and (now - _position_cache_time) < 5:
         return _position_cache
 
+    # 確保資料夾存在
+    dirpath = os.path.dirname(path)
+    if not os.path.exists(dirpath):
+        os.makedirs(dirpath)
+        if debug_mode():
+            log(f"[DEBUG] 建立資料夾: {dirpath}", level="DEBUG")
+
+    # 如果檔案不存在，寫入空dict並回傳
+    if not os.path.exists(path):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+            _position_cache = {}
+            _position_cache_time = now
+            return {}
+        except Exception as e:
+            log(f"[錯誤] 建立空持倉檔失敗: {e}\n{traceback.format_exc()}", level="ERROR")
+            return {}
+
     try:
-        with _lock:
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT symbol, direction, contracts, price, confidence, add_times, reduce_times, extra FROM position_state")
-                rows = cursor.fetchall()
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if not content:
+                _position_cache = {}
+                _position_cache_time = now
+                return {}
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                log(f"[錯誤] 持倉檔格式錯誤，非 dict，重置為空 dict", level="ERROR")
+                with open(path, "w", encoding="utf-8") as fw:
+                    json.dump({}, fw)
+                _position_cache = {}
+                _position_cache_time = now
+                return {}
+            _position_cache = data
+            _position_cache_time = now
+            return data
     except Exception as e:
-        log(f"[錯誤] 讀取持倉狀態失敗: {e}\n{traceback.format_exc()}", level="ERROR")
+        log(f"[錯誤] 讀取持倉檔失敗: {e}\n{traceback.format_exc()}", level="ERROR")
         return {}
 
-    positions = {}
-    for row in rows:
-        symbol, direction, contracts, price, confidence, add_times, reduce_times, extra_json = row
-        try:
-            extra = json.loads(extra_json)
-        except Exception:
-            extra = {}
-        positions[symbol] = {
-            "direction": direction,
-            "contracts": contracts,
-            "price": price,
-            "confidence": confidence,
-            "add_times": add_times,
-            "reduce_times": reduce_times,
-            **extra
-        }
+# --- 取得指定持倉資訊 ---
+def get_position_state(symbol):
+    positions = load_position_state()
+    return positions.get(symbol)
 
-    _position_cache = positions
-    _position_cache_time = now
-    return positions
-
-def _save_position_state(positions):
-    """
-    將持倉狀態寫回資料庫，extra 欄位 JSON 序列化
-    """
-    with _lock:
-        try:
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                for symbol, pos in positions.items():
-                    extra = {k:v for k,v in pos.items() if k not in ("direction","contracts","price","confidence","add_times","reduce_times")}
-                    extra_json = json.dumps(extra)
-                    cursor.execute('''
-                        INSERT INTO position_state (symbol, direction, contracts, price, confidence, add_times, reduce_times, extra)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(symbol) DO UPDATE SET
-                            direction=excluded.direction,
-                            contracts=excluded.contracts,
-                            price=excluded.price,
-                            confidence=excluded.confidence,
-                            add_times=excluded.add_times,
-                            reduce_times=excluded.reduce_times,
-                            extra=excluded.extra
-                    ''', (symbol, pos.get("direction"), pos.get("contracts"), pos.get("price"), pos.get("confidence"),
-                          pos.get("add_times", 0), pos.get("reduce_times", 0), extra_json))
-                conn.commit()
-        except Exception as e:
-            log(f"[錯誤] 寫入持倉狀態失敗: {e}\n{traceback.format_exc()}", level="ERROR")
-
+# --- 更新或新增持倉資訊 ---
 def update_position_state(symbol, direction, contracts, price, confidence, extra=None, add=False):
-    """
-    新增或更新持倉資料
-    """
-    with _lock:
+    with lock:
         positions = load_position_state()
         if symbol not in positions:
             positions[symbol] = {
                 "direction": direction,
                 "contracts": contracts,
                 "price": price,
-                "confidence": confidence,
-                "add_times": 0,
-                "reduce_times": 0
+                "confidence": confidence
             }
         else:
             if add:
@@ -186,11 +120,9 @@ def update_position_state(symbol, direction, contracts, price, confidence, extra
         if debug_mode():
             log(f"[DEBUG] 更新持倉: {symbol} 張數={positions[symbol]['contracts']}", level="DEBUG")
 
+# --- 減倉後更新持倉數量和減倉次數 ---
 def update_position_after_reduce(symbol, reduced_contracts, new_reduce_times=None):
-    """
-    減倉後更新持倉數量與減倉次數
-    """
-    with _lock:
+    with lock:
         positions = load_position_state()
         if symbol in positions:
             positions[symbol]["contracts"] -= reduced_contracts
@@ -202,11 +134,9 @@ def update_position_after_reduce(symbol, reduced_contracts, new_reduce_times=Non
         if debug_mode():
             log(f"[DEBUG] 減倉後更新持倉: {symbol} 剩餘張數={positions.get(symbol, {}).get('contracts', 0)}", level="DEBUG")
 
+# --- 移除指定持倉 ---
 def remove_position(symbol):
-    """
-    移除指定持倉
-    """
-    with _lock:
+    with lock:
         positions = load_position_state()
         if symbol in positions:
             del positions[symbol]
@@ -214,20 +144,25 @@ def remove_position(symbol):
         if debug_mode():
             log(f"[DEBUG] 移除持倉: {symbol}", level="DEBUG")
 
-def get_position_state(symbol):
-    """
-    取得指定持倉詳細資料
-    """
-    positions = load_position_state()
-    return positions.get(symbol)
+# --- 私有函式：寫入持倉狀態到檔案 ---
+def _save_position_state(positions):
+    path = _get_position_state_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(positions, f, indent=2)
+        if debug_mode():
+            log(f"[DEBUG] 寫入持倉成功，共 {len(positions)} 檔", level="DEBUG")
+    except Exception as e:
+        log(f"[錯誤] 寫入持倉失敗: {e}\n{traceback.format_exc()}", level="ERROR")
 
-# ------------------ 交易紀錄相關 --------------------
-
+# --- 寫入交易紀錄（jsonl格式） ---
 def record_trade_log(data):
     """
-    新增一筆交易紀錄到 trade_logs 表，會補 timestamp 與 log_timestamp
+    將交易紀錄追加到trade_logs.jsonl檔案。
+    會補足時間戳欄位，並確保資料夾存在。
     """
-    dirpath = os.path.dirname(STATE_DB_PATH)
+    path = _get_trade_log_path()
+    dirpath = os.path.dirname(path)
     if not os.path.exists(dirpath):
         os.makedirs(dirpath)
         if debug_mode():
@@ -238,88 +173,66 @@ def record_trade_log(data):
     if "log_timestamp" not in data:
         data["log_timestamp"] = int(time.time())
 
-    with _lock:
-        try:
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO trade_logs (symbol, direction, pnl, operation, timestamp, log_timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (data.get("symbol"), data.get("direction"), data.get("pnl", 0), data.get("operation"),
-                      data["timestamp"], data["log_timestamp"]))
-                conn.commit()
-            if debug_mode():
-                log(f"[記錄成功] 新增交易紀錄: {data}", level="DEBUG")
-        except Exception as e:
-            log(f"[錯誤] 新增交易紀錄失敗: {e}\n{traceback.format_exc()}", level="ERROR")
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        if debug_mode():
+            log(f"[記錄成功] 寫入交易紀錄: {data}", level="DEBUG")
+    except Exception as e:
+        log(f"[錯誤] 寫入交易紀錄失敗: {e}\n{traceback.format_exc()}", level="ERROR")
 
-# ------------------ 保留獲利相關 --------------------
-
+# --- 累加保留獲利 ---
 def add_profit(amount):
-    """
-    累加保留獲利金額
-    """
-    with _lock:
-        try:
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("INSERT OR IGNORE INTO reserved_profit (id, reserved) VALUES (1, 0)")
-                cursor.execute("UPDATE reserved_profit SET reserved = reserved + ? WHERE id = 1", (amount,))
-                conn.commit()
-            if debug_mode():
-                log(f"[DEBUG] 累加保留獲利: +{amount}", level="DEBUG")
-        except Exception as e:
-            log(f"[錯誤] 累加保留獲利失敗: {e}\n{traceback.format_exc()}", level="ERROR")
+    path = _get_profit_path()
+    dirpath = os.path.dirname(path)
+    if not os.path.exists(dirpath):
+        os.makedirs(dirpath)
+        if debug_mode():
+            log(f"[DEBUG] 建立資料夾: {dirpath}", level="DEBUG")
 
+    data = {"reserved": 0}
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                if isinstance(d, dict) and "reserved" in d:
+                    data = d
+        data["reserved"] += amount
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        if debug_mode():
+            log(f"[DEBUG] 累加保留獲利: +{amount}，總計: {data['reserved']}", level="DEBUG")
+    except Exception as e:
+        log(f"[錯誤] 儲存保留獲利失敗: {e}\n{traceback.format_exc()}", level="ERROR")
+
+# --- 取得保留獲利 ---
 def get_reserved_profit():
-    """
-    取得目前保留獲利，找不到時回傳 0
-    """
-    with _lock:
-        try:
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT reserved FROM reserved_profit WHERE id = 1")
-                row = cursor.fetchone()
-                if row:
-                    return row[0]
-        except Exception as e:
-            log(f"[錯誤] 查詢保留獲利失敗: {e}\n{traceback.format_exc()}", level="ERROR")
+    path = _get_profit_path()
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                if isinstance(d, dict):
+                    return d.get("reserved", 0)
+    except Exception as e:
+        log(f"[錯誤] 查詢保留獲利失敗: {e}\n{traceback.format_exc()}", level="ERROR")
     return 0
 
+# --- 重置保留獲利 ---
 def reset_reserved_profit():
-    """
-    重置保留獲利為 0
-    """
-    with _lock:
-        try:
-            with get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("UPDATE reserved_profit SET reserved = 0 WHERE id = 1")
-                conn.commit()
-            if debug_mode():
-                log(f"[DEBUG] 保留獲利已重置為 0", level="DEBUG")
-        except Exception as e:
-            log(f"[錯誤] 重置保留獲利失敗: {e}\n{traceback.format_exc()}", level="ERROR")
-
-def load_latest_selection_db():
-    """
-    從 latest_selection.db 資料庫讀取最新選幣結果。
-    回傳格式為 dict: {symbol: {"confidence": confidence}, ...}
-    """
+    path = _get_profit_path()
     try:
-        with _lock:
-            with get_db_connection(LATEST_SELECTION_DB_PATH) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT symbol, confidence FROM latest_selection")
-                rows = cursor.fetchall()
-                return {symbol: {"confidence": confidence} for symbol, confidence in rows}
+        dirpath = os.path.dirname(path)
+        if not os.path.exists(dirpath):
+            os.makedirs(dirpath)
+            if debug_mode():
+                log(f"[DEBUG] 建立資料夾: {dirpath}", level="DEBUG")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"reserved": 0}, f)
+        if debug_mode():
+            log(f"[DEBUG] 已重置保留獲利為 0", level="DEBUG")
     except Exception as e:
-        log(f"[錯誤] 讀取最新選幣資料庫失敗: {e}", level="ERROR")
-        return {}
+        log(f"[錯誤] 重置保留獲利失敗: {e}\n{traceback.format_exc()}", level="ERROR")
 
-
-# --- 啟動時初始化資料表與資料夾 ---
-init_db()
-if debug_mode():
-    log("[DEBUG] 狀態管理器初始化完成", level="DEBUG")
+# --- 啟動時初始化所需資料夾 ---
+init_data_dirs()

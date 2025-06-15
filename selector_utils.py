@@ -3,45 +3,15 @@ import json
 import time
 import pandas as pd
 import requests
-import sqlite3
-from config import get_runtime_config, debug_mode, test_mode
+from config import get_runtime_config, debug_mode
 from logger import log
 from okx_client import get_ohlcv
 
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-RESULT_DIR = os.path.join(BASE_DIR, "json_results")
-os.makedirs(RESULT_DIR, exist_ok=True)
-
-COOLDOWN_DB_PATH = os.path.join(RESULT_DIR, "cooldown_pool.db")
-BLOCKED_DB_PATH = os.path.join(RESULT_DIR, "blocked_symbols.db")
-
-def get_db_connection(db_path):
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
-
-def init_cooldown_db():
-    with get_db_connection(COOLDOWN_DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS cooldown_pool (
-                symbol TEXT PRIMARY KEY,
-                timestamp INTEGER
-            )
-        ''')
-        conn.commit()
-
-def init_blocked_db():
-    with get_db_connection(BLOCKED_DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS blocked_symbols (
-                symbol TEXT PRIMARY KEY
-            )
-        ''')
-        conn.commit()
-
+# === ✅ 取得所有 USDT 永續合約（並根據 24H 成交額過濾）===
 def get_all_usdt_swap_symbols():
+    """
+    從 OKX API 取得所有 USDT 永續合約，並依照24小時成交額過濾。
+    """
     config = get_runtime_config()
     min_volume = config.get("MIN_24H_VOLUME_USDT", 100000000)
 
@@ -64,7 +34,7 @@ def get_all_usdt_swap_symbols():
     if debug_mode():
         log(f"[DEBUG] 取得 USDT-SWAP 合約共 {len(symbols)} 檔")
         try:
-            result_path = os.path.join(RESULT_DIR, "instruments_list.json")
+            result_path = os.path.join(os.path.dirname(__file__), "json_results", "instruments_list.json")
             _safe_save_list(symbols, result_path)
             log(f"[INFO] 已儲存合約列表到 {result_path}")
         except Exception as e:
@@ -73,6 +43,9 @@ def get_all_usdt_swap_symbols():
     return symbols
 
 def _safe_save_list(data_list, path):
+    """
+    安全儲存 list 到 json，確保型態正確。
+    """
     dirpath = os.path.dirname(path)
     if not os.path.exists(dirpath):
         os.makedirs(dirpath)
@@ -81,8 +54,11 @@ def _safe_save_list(data_list, path):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data_list, f, ensure_ascii=False, indent=2)
 
+# === 防呆載入最新選幣結果（dict格式，list會轉dict，空也安全）===
 def load_latest_selection(path="json_results/latest_selection.json"):
-    # 這裡你可依需求保留或改DB讀取
+    """
+    載入最新選幣結果，無論原檔為 list/dict，都保證回傳 dict。
+    """
     if not os.path.exists(path):
         return {}
     try:
@@ -91,41 +67,18 @@ def load_latest_selection(path="json_results/latest_selection.json"):
             if isinstance(data, dict):
                 return data
             elif isinstance(data, list):
+                # 將 list 轉為 {symbol: item}
                 return {x["symbol"]: x for x in data if isinstance(x, dict) and "symbol" in x}
             return {}
     except Exception as e:
         log(f"[錯誤] 讀取選幣結果失敗: {e}", "ERROR")
         return {}
 
-def filter_candidates_by_position(candidates, position_state, config):
-    holding_symbols_dirs = {(sym, pos['direction']) for sym, pos in position_state.items()}
-    holding_symbols = set(position_state.keys())
-
-    debug_enabled = test_mode() or debug_mode()
-
-    filtered = []
-    for c in candidates:
-        if not isinstance(c, dict) or 'symbol' not in c:
-            log(f"[錯誤] 候選清單元素格式錯誤或缺少symbol: {c}", level="ERROR")
-            continue
-        symbol = c['symbol']
-        direction = c.get('direction', 'buy')
-        opposite_direction = 'buy' if direction == 'sell' else 'sell'
-
-        if (symbol, opposite_direction) in holding_symbols_dirs:
-            if debug_enabled:
-                log(f"[選幣過濾] {symbol} 方向{direction}因相反方向持倉存在，跳過", level="DEBUG")
-            continue
-
-        if symbol not in holding_symbols and len(holding_symbols) >= config.get("MAX_HOLDING_SYMBOLS", 6):
-            if debug_enabled:
-                log(f"[選幣過濾] 持倉已達上限，拒絕新標的 {symbol}", level="DEBUG")
-            continue
-
-        filtered.append(c)
-    return filtered
-
+# === 簡單預篩條件 ===
 def pass_pre_filter(symbol, ohlcv_df, config):
+    """
+    判斷 K 線資料是否通過預篩條件，並顯示詳細原因。
+    """
     if ohlcv_df is None or len(ohlcv_df) < 10:
         if debug_mode():
             log(f"[DEBUG][預篩] {symbol} K線資料不足，略過")
@@ -148,76 +101,36 @@ def pass_pre_filter(symbol, ohlcv_df, config):
 
     return True
 
+# === 判斷是否在冷卻中 ===
 def is_symbol_cooled_down(symbol, cooldown_pool, config):
+    """
+    判斷該 symbol 是否還在冷卻池時間內。
+    """
     cooldown = cooldown_pool.get(symbol)
     if not cooldown:
         return False
     duration = config.get("COOLDOWN_DURATION", 3600)
     return (int(time.time()) - cooldown.get("timestamp", 0)) < duration
 
+# === 判斷是否為封鎖幣種（黑名單）===
 def is_symbol_blocked(symbol, config):
-    # 改成從 blocked_symbols DB 讀
-    blocked_set = load_blocked_symbols_db()
-    return symbol in blocked_set
+    """
+    判斷是否在黑名單中。
+    """
+    blocked_list = config.get("BLOCKED_SYMBOLS", [])
+    return symbol in blocked_list
 
-# === 新增函式從資料庫載入冷卻池 ===
-def load_cooldown_pool_db():
-    init_cooldown_db()
-    cooldown = {}
-    try:
-        with get_db_connection(COOLDOWN_DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT symbol, timestamp FROM cooldown_pool")
-            rows = cursor.fetchall()
-            for symbol, ts in rows:
-                cooldown[symbol] = {"timestamp": ts}
-    except Exception as e:
-        log(f"[錯誤] 讀取冷卻池資料庫失敗: {e}", level="ERROR")
-    return cooldown
-
-def init_cooldown_db():
-    with get_db_connection(COOLDOWN_DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS cooldown_pool (
-                symbol TEXT PRIMARY KEY,
-                timestamp INTEGER
-            )
-        ''')
-        conn.commit()
-
-# === 新增函式從資料庫載入封鎖列表 ===
-def load_blocked_symbols_db():
-    init_blocked_db()
-    blocked = set()
-    try:
-        with get_db_connection(BLOCKED_DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT symbol FROM blocked_symbols")
-            rows = cursor.fetchall()
-            blocked = {row[0] for row in rows}
-    except Exception as e:
-        log(f"[錯誤] 讀取封鎖列表資料庫失敗: {e}", level="ERROR")
-    return blocked
-
-def init_blocked_db():
-    with get_db_connection(BLOCKED_DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS blocked_symbols (
-                symbol TEXT PRIMARY KEY
-            )
-        ''')
-        conn.commit()
-
-# 批次取得 K 線資料
+# === 批次取得 K 線資料 ===
 def get_ohlcv_batch(symbol_list, timeframe="1h", limit=100, config=None):
+    """
+    批次取得所有 symbol 的 K 線資料，回傳 dict 格式。
+    """
     result = {}
     for symbol in symbol_list:
         try:
             df = get_ohlcv(symbol, timeframe, limit)
             if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
-                df = df.iloc[:, :6]
+                df = df.iloc[:, :6]  # 保留 open, high, low, close, volume, ts
                 result[symbol] = df
                 if debug_mode():
                     log(f"[DEBUG] 取得 K 線: {symbol} 共 {len(df)} 筆")
@@ -227,9 +140,3 @@ def get_ohlcv_batch(symbol_list, timeframe="1h", limit=100, config=None):
         except Exception as e:
             log(f"[錯誤] 無法取得 {symbol} 的 K 線: {e}", "ERROR")
     return result
-
-# 修改 load_symbol_locks() 改用資料庫讀取
-def load_symbol_locks():
-    cooldown = load_cooldown_pool_db()
-    blocked = load_blocked_symbols_db()
-    return cooldown, blocked

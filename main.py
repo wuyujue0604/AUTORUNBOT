@@ -8,8 +8,9 @@ from logger import log
 from auto_selector import run_selector
 from order_executor import run_order_executor
 from position_monitor import run_position_monitor
-from order_notifier import log_trade_action  # 改用新的紀錄函式
+import order_notifier  # 通知模組
 
+# 將當前目錄加入模組路徑，確保可正確 import
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 def main_loop():
@@ -23,6 +24,7 @@ def main_loop():
     selector_interval = config.get("SELECTOR_LOOP_INTERVAL", 45)  # 選幣間隔
     position_monitor_interval = config.get("POSITION_MONITOR_LOOP_INTERVAL", 5)  # 持倉監控間隔
 
+    order_notifier.start_notification_thread()
     log("[主控] 交易系統啟動，開始單線程非阻塞週期任務")
 
     while True:
@@ -35,7 +37,10 @@ def main_loop():
                 log("=" * 50)
                 log(f"🕒 [持倉監控] 開始執行: {now_dt.strftime('%Y-%m-%d %H:%M:%S')}")
                 try:
+                    start_time = time.perf_counter()
                     run_position_monitor()
+                    duration = time.perf_counter() - start_time
+                    log(f"✅ [持倉監控] 執行完畢，耗時 {duration:.2f} 秒")
                 except Exception as e:
                     log(f"[錯誤][持倉監控] 發生例外: {e}\n{traceback.format_exc()}", level="ERROR")
                 last_position_monitor_time = now
@@ -45,31 +50,28 @@ def main_loop():
                 log("=" * 50)
                 log(f"🕒 [選幣+下單] 開始執行: {now_dt.strftime('%Y-%m-%d %H:%M:%S')}")
                 try:
+                    start_time = time.perf_counter()
                     run_selector()
+                    selector_duration = time.perf_counter() - start_time
+                    log(f"✅ [選幣] 執行完畢，耗時 {selector_duration:.2f} 秒")
                 except Exception as e:
                     log(f"[錯誤][選幣] 發生例外: {e}\n{traceback.format_exc()}", level="ERROR")
 
                 try:
+                    start_time = time.perf_counter()
                     trades = run_order_executor()
+                    executor_duration = time.perf_counter() - start_time
+                    log(f"✅ [下單模組] 執行完畢，耗時 {executor_duration:.2f} 秒")
+
                     if trades and isinstance(trades, list):
                         for trade in trades:
-                            # 將 queue_trade 改成 log_trade_action，拆欄位傳入
-                            log_trade_action(
-                                trade["symbol"],
-                                trade["operation"],
-                                trade["direction"],
-                                trade["confidence"],
-                                trade["price"],
-                                trade["contracts"],
-                                trade.get("pnl")
-)
+                            order_notifier.queue_trade(trade)
                 except Exception as e:
                     log(f"[錯誤][下單] 發生例外: {e}\n{traceback.format_exc()}", level="ERROR")
 
                 last_selector_time = now
 
             time.sleep(0.1)  # 小睡避免CPU全忙
-
             error_count = 0  # 成功後重置錯誤計數
 
         except KeyboardInterrupt:
